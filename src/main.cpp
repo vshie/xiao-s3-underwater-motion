@@ -140,7 +140,7 @@ static bool initCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_QVGA;        // 320x240
-  config.pixel_format = PIXFORMAT_GRAYSCALE; // 1 byte/pixel for diffing
+  config.pixel_format = PIXFORMAT_RGB565;    // color preview; luma derived for diffing
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
@@ -157,36 +157,48 @@ static bool initCamera() {
 // ---------------------------------------------------------------------------
 // Motion detection on a grayscale frame
 // ---------------------------------------------------------------------------
+// Derive 8-bit luminance from a big-endian RGB565 pixel (matches the byte
+// order the camera driver/JPEG encoder use).
+static inline uint8_t rgb565Luma(uint8_t hb, uint8_t lb) {
+  uint8_t r = hb & 0xF8;
+  uint8_t g = ((hb & 0x07) << 5) | ((lb & 0xE0) >> 3);
+  uint8_t b = (lb & 0x1F) << 3;
+  return (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
+}
+
 static void detectMotion(camera_fb_t *fb) {
-  const size_t len = fb->len;
+  // RGB565 -> one luma byte per pixel for the reference frame.
+  const size_t numPixels = fb->len / 2;
 
-  if (g_prevFrame == nullptr || g_prevLen != len) {
+  if (g_prevFrame == nullptr || g_prevLen != numPixels) {
     if (g_prevFrame) free(g_prevFrame);
-    g_prevFrame = (uint8_t *)ps_malloc(len);
-    g_prevLen = len;
+    g_prevFrame = (uint8_t *)ps_malloc(numPixels);
+    g_prevLen = numPixels;
     g_haveStat = false;
-  }
-
-  if (!g_haveStat) {
-    if (g_prevFrame) memcpy(g_prevFrame, fb->buf, len);
-    g_haveStat = true;
-    g_changedPermille = 0;
-    g_motion = false;
-    return;
   }
 
   // Sample every 4th pixel; plenty for whole-scene motion and much cheaper.
   const size_t stride = 4;
   const uint16_t thr = g_set.pixelThreshold;
   size_t sampled = 0, changed = 0;
-  for (size_t i = 0; i < len; i += stride) {
-    int d = (int)fb->buf[i] - (int)g_prevFrame[i];
-    if (d < 0) d = -d;
-    if ((uint16_t)d >= thr) changed++;
-    sampled++;
+
+  if (!g_haveStat) {
+    for (size_t p = 0; p < numPixels; p += stride)
+      g_prevFrame[p] = rgb565Luma(fb->buf[p * 2], fb->buf[p * 2 + 1]);
+    g_haveStat = true;
+    g_changedPermille = 0;
+    g_motion = false;
+    return;
   }
 
-  memcpy(g_prevFrame, fb->buf, len);
+  for (size_t p = 0; p < numPixels; p += stride) {
+    uint8_t luma = rgb565Luma(fb->buf[p * 2], fb->buf[p * 2 + 1]);
+    int d = (int)luma - (int)g_prevFrame[p];
+    if (d < 0) d = -d;
+    if ((uint16_t)d >= thr) changed++;
+    g_prevFrame[p] = luma;  // update reference as we go
+    sampled++;
+  }
 
   uint16_t permille = sampled ? (uint16_t)((changed * 1000UL) / sampled) : 0;
   g_changedPermille = permille;
