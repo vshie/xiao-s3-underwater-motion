@@ -298,11 +298,16 @@ $('g_all').onchange = () => { document.querySelectorAll('.gsel').forEach(c=>c.ch
 $('g_dl').onclick = () => {
   const sel = gSelected();
   if(!sel.length){ alert('Select at least one file.'); return; }
+  // Pause the live preview so the WiFi radio + camera aren't competing with
+  // the file transfer (reduces the current spike that can brown out the board).
+  $('cam').src = '';
+  $('g_space').textContent = 'Downloading '+sel.length+' file(s)... preview paused.';
   // Stagger downloads so the browser does not block them.
   sel.forEach((n,i) => setTimeout(()=>{
     const a=document.createElement('a'); a.href='/file?name='+encodeURIComponent(n); a.download=n;
     document.body.appendChild(a); a.click(); a.remove();
-  }, i*350));
+    if(i === sel.length-1) setTimeout(()=>{ startStream(); loadGallery(); }, 1500);
+  }, i*400));
 };
 
 $('g_del').onclick = async () => {

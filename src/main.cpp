@@ -98,6 +98,7 @@ static uint8_t *g_jpg = nullptr;
 static size_t   g_jpgLen = 0;
 
 // SD card state
+static SemaphoreHandle_t g_sdMutex = nullptr;  // serializes all SD access
 static bool     g_sdReady   = false;
 static uint32_t g_bootId    = 0;   // unique per power-up, used in filenames
 static uint32_t g_imgIndex  = 0;   // frame counter within this boot
@@ -346,6 +347,10 @@ static void saveImageToSD() {
   }
   if (!copy) return;
 
+  // If a download/listing is in progress, skip this save rather than block
+  // the main loop (and never touch the card concurrently).
+  if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(80)) != pdTRUE) { free(copy); return; }
+
   char path[40];
   snprintf(path, sizeof(path), "/motion/m%lu_%05lu.jpg",
            (unsigned long)g_bootId, (unsigned long)g_imgIndex);
@@ -359,6 +364,7 @@ static void saveImageToSD() {
     Serial.printf("SD: failed to open %s\n", path);
     g_sdReady = false;  // card likely pulled; stop trying until reboot
   }
+  xSemaphoreGive(g_sdMutex);
   free(copy);
 }
 
@@ -482,10 +488,18 @@ static bool queryName(httpd_req_t *req, char *out, size_t outLen) {
   return validName(out);
 }
 
+// Static read buffer: g_webServer handles requests on a single task, so the
+// gallery handlers never run concurrently with each other. Keeping this off
+// the handler stack avoids overflowing it during file transfers.
+static uint8_t g_fileBuf[2048];
+
 static esp_err_t listHandler(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   if (!g_sdReady) return httpd_resp_sendstr(req, "{\"sdReady\":false,\"files\":[]}");
+
+  if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(4000)) != pdTRUE)
+    return httpd_resp_sendstr(req, "{\"sdReady\":true,\"busy\":true,\"files\":[]}");
 
   char head[112];
   uint64_t totalMB = SD_MMC.totalBytes() / (1024ULL * 1024ULL);
@@ -514,6 +528,7 @@ static esp_err_t listHandler(httpd_req_t *req) {
     }
     dir.close();
   }
+  xSemaphoreGive(g_sdMutex);
   httpd_resp_sendstr_chunk(req, "]}");
   httpd_resp_sendstr_chunk(req, NULL);
   return ESP_OK;
@@ -525,11 +540,17 @@ static esp_err_t fileHandler(httpd_req_t *req) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad request");
     return ESP_FAIL;
   }
+  if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(4000)) != pdTRUE) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sd busy");
+    return ESP_FAIL;
+  }
+
   char path[96];
   snprintf(path, sizeof(path), "/motion/%s", name);
   File f = SD_MMC.open(path);
   if (!f || f.isDirectory()) {
     if (f) f.close();
+    xSemaphoreGive(g_sdMutex);
     httpd_resp_send_404(req);
     return ESP_FAIL;
   }
@@ -538,13 +559,13 @@ static esp_err_t fileHandler(httpd_req_t *req) {
   snprintf(disp, sizeof(disp), "attachment; filename=%s", name);
   httpd_resp_set_hdr(req, "Content-Disposition", disp);
 
-  uint8_t buf[1024];
   size_t r;
   esp_err_t res = ESP_OK;
-  while ((r = f.read(buf, sizeof(buf))) > 0) {
-    if (httpd_resp_send_chunk(req, (const char *)buf, r) != ESP_OK) { res = ESP_FAIL; break; }
+  while ((r = f.read(g_fileBuf, sizeof(g_fileBuf))) > 0) {
+    if (httpd_resp_send_chunk(req, (const char *)g_fileBuf, r) != ESP_OK) { res = ESP_FAIL; break; }
   }
   f.close();
+  xSemaphoreGive(g_sdMutex);
   if (res == ESP_OK) httpd_resp_send_chunk(req, NULL, 0);
   return res;
 }
@@ -555,9 +576,13 @@ static esp_err_t deleteHandler(httpd_req_t *req) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad request");
     return ESP_FAIL;
   }
-  char path[96];
-  snprintf(path, sizeof(path), "/motion/%s", name);
-  bool ok = SD_MMC.remove(path);
+  bool ok = false;
+  if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(4000)) == pdTRUE) {
+    char path[96];
+    snprintf(path, sizeof(path), "/motion/%s", name);
+    ok = SD_MMC.remove(path);
+    xSemaphoreGive(g_sdMutex);
+  }
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
@@ -617,6 +642,7 @@ static void registerUri(httpd_handle_t s, const char *path, httpd_method_t m,
 static void startServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.max_uri_handlers = 16;
+  config.stack_size = 10240;  // headroom for SD/FATFS calls in file handlers
 
   if (httpd_start(&g_webServer, &config) == ESP_OK) {
     registerUri(g_webServer, "/", HTTP_GET, indexHandler);
@@ -645,6 +671,8 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\nXIAO ESP32-S3 Underwater Motion Detector");
+  Serial.printf("Last reset reason: %d (1=poweron 3=sw 4=panic 5=int_wdt 6=task_wdt 7=wdt 8=deepsleep 11=brownout)\n",
+                (int)esp_reset_reason());
 
   pinMode(DIGITAL_OUT_PIN, OUTPUT);
   digitalWrite(DIGITAL_OUT_PIN, LOW);
@@ -656,6 +684,7 @@ void setup() {
 
   loadSettings();
   g_jpgMutex = xSemaphoreCreateMutex();
+  g_sdMutex = xSemaphoreCreateMutex();
 
   if (!initCamera()) {
     Serial.println("Halting: camera unavailable.");
@@ -668,6 +697,10 @@ void setup() {
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
+  // Trim TX power to cut the WiFi current spikes that brown out the 3.3V rail
+  // during downloads. Still fine for close-range bench tuning; raise toward
+  // WIFI_POWER_19_5dBm if you need more range and your supply is solid.
+  WiFi.setTxPower(WIFI_POWER_11dBm);
   IPAddress ip = WiFi.softAPIP();
   Serial.printf("SoftAP \"%s\" up. Open http://%s/\n", AP_SSID, ip.toString().c_str());
 
