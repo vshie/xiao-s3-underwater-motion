@@ -45,6 +45,16 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .toggle { display:flex; align-items:center; gap:10px; font-size:13px; cursor:pointer; }
   .toggle input { width:18px; height:18px; accent-color:var(--accent); }
   code { background:#0e1a26; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .gtools { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:10px 0; }
+  .gtools button { flex:0 0 auto; padding:7px 14px; }
+  .glist { max-height:280px; overflow-y:auto; border:1px solid var(--line); border-radius:8px; background:#0e1a26; }
+  .grow { display:flex; align-items:center; gap:10px; padding:7px 10px; border-bottom:1px solid var(--line); font-size:13px; cursor:pointer; }
+  .grow:last-child { border-bottom:none; }
+  .grow input { width:16px; height:16px; accent-color:var(--accent); }
+  .gn { flex:1; font-variant-numeric:tabular-nums; word-break:break-all; }
+  .gs { color:var(--mut); font-size:12px; white-space:nowrap; }
+  .grow a { color:var(--accent); text-decoration:none; font-size:17px; padding:0 4px; }
+  .gempty { padding:14px; color:var(--mut); font-size:13px; text-align:center; }
 </style>
 </head>
 <body>
@@ -151,6 +161,20 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         Enable + <b>Save to flash</b> to persist across reboots.</div>
     </div>
   </section>
+
+  <section class="card" style="grid-column:1 / -1">
+    <h2>Gallery</h2>
+    <div class="hint" id="g_space">--</div>
+    <div class="gtools">
+      <label class="toggle"><input type="checkbox" id="g_all"><span>Select all</span></label>
+      <button id="g_refresh">Refresh</button>
+    </div>
+    <div id="g_list" class="glist"><div class="gempty">Press Refresh to load.</div></div>
+    <div class="btns" style="margin-top:12px">
+      <button class="primary" id="g_dl">Download selected</button>
+      <button id="g_del">Delete selected</button>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -241,6 +265,53 @@ function startStream(){
   // MJPEG stream lives on port 81 of the same host.
   $('cam').src = 'http://'+location.hostname+':81/stream';
 }
+
+// ---- Gallery ----
+function gSelected(){ return [...document.querySelectorAll('.gsel:checked')].map(c=>c.value); }
+
+async function loadGallery(){
+  $('g_space').textContent = 'Loading...';
+  let d;
+  try { d = await (await fetch('/list')).json(); }
+  catch(e){ $('g_space').textContent = 'Could not read SD card.'; return; }
+  const list = $('g_list'); list.innerHTML = '';
+  if(!d.sdReady){ $('g_space').textContent = 'No SD card detected.'; list.innerHTML = '<div class="gempty">No card.</div>'; return; }
+  $('g_space').textContent = d.files.length+' file(s) · '+d.freeMB.toLocaleString()+' MB free of '+d.totalMB.toLocaleString()+' MB';
+  if(!d.files.length){ list.innerHTML = '<div class="gempty">No images captured yet.</div>'; }
+  d.files.sort((a,b)=>a.name<b.name?1:-1); // newest-ish first
+  for(const f of d.files){
+    const row = document.createElement('label'); row.className = 'grow';
+    const cb = document.createElement('input'); cb.type='checkbox'; cb.className='gsel'; cb.value=f.name;
+    const nm = document.createElement('span'); nm.className='gn'; nm.textContent=f.name;
+    const sz = document.createElement('span'); sz.className='gs'; sz.textContent=(f.size/1024).toFixed(1)+' KB';
+    const a = document.createElement('a'); a.href='/file?name='+encodeURIComponent(f.name); a.download=f.name; a.textContent='\u2193'; a.title='Download';
+    a.addEventListener('click', e=>e.stopPropagation());
+    row.append(cb, nm, sz, a);
+    list.appendChild(row);
+  }
+  $('g_all').checked = false;
+}
+
+$('g_refresh').onclick = loadGallery;
+$('g_all').onchange = () => { document.querySelectorAll('.gsel').forEach(c=>c.checked=$('g_all').checked); };
+
+$('g_dl').onclick = () => {
+  const sel = gSelected();
+  if(!sel.length){ alert('Select at least one file.'); return; }
+  // Stagger downloads so the browser does not block them.
+  sel.forEach((n,i) => setTimeout(()=>{
+    const a=document.createElement('a'); a.href='/file?name='+encodeURIComponent(n); a.download=n;
+    document.body.appendChild(a); a.click(); a.remove();
+  }, i*350));
+};
+
+$('g_del').onclick = async () => {
+  const sel = gSelected();
+  if(!sel.length){ alert('Select at least one file.'); return; }
+  if(!confirm('Delete '+sel.length+' file(s)? This cannot be undone.')) return;
+  for(const n of sel){ await fetch('/delete?name='+encodeURIComponent(n)); }
+  await loadGallery();
+};
 
 loadSettings().then(startStream);
 setInterval(poll, 400);

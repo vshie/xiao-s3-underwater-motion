@@ -464,6 +464,105 @@ static esp_err_t captureHandler(httpd_req_t *req) {
 }
 
 // ---------------------------------------------------------------------------
+// Gallery: list / download / delete files in /motion
+// ---------------------------------------------------------------------------
+// Reject anything but a bare filename to prevent path traversal.
+static bool validName(const char *n) {
+  if (!n || !*n) return false;
+  if (strstr(n, "..")) return false;
+  for (const char *p = n; *p; p++)
+    if (*p == '/' || *p == '\\') return false;
+  return true;
+}
+
+static bool queryName(httpd_req_t *req, char *out, size_t outLen) {
+  char query[160];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+  if (httpd_query_key_value(query, "name", out, outLen) != ESP_OK) return false;
+  return validName(out);
+}
+
+static esp_err_t listHandler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  if (!g_sdReady) return httpd_resp_sendstr(req, "{\"sdReady\":false,\"files\":[]}");
+
+  char head[112];
+  uint64_t totalMB = SD_MMC.totalBytes() / (1024ULL * 1024ULL);
+  uint64_t freeMB = (SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL);
+  snprintf(head, sizeof(head),
+           "{\"sdReady\":true,\"totalMB\":%llu,\"freeMB\":%llu,\"files\":[",
+           totalMB, freeMB);
+  httpd_resp_sendstr_chunk(req, head);
+
+  File dir = SD_MMC.open("/motion");
+  bool first = true;
+  int count = 0;
+  const int LIMIT = 2000;
+  if (dir) {
+    for (File f = dir.openNextFile(); f && count < LIMIT; f = dir.openNextFile()) {
+      if (f.isDirectory()) continue;
+      const char *nm = f.name();
+      const char *base = strrchr(nm, '/');
+      base = base ? base + 1 : nm;
+      char ent[128];
+      snprintf(ent, sizeof(ent), "%s{\"name\":\"%s\",\"size\":%u}",
+               first ? "" : ",", base, (unsigned)f.size());
+      httpd_resp_sendstr_chunk(req, ent);
+      first = false;
+      count++;
+    }
+    dir.close();
+  }
+  httpd_resp_sendstr_chunk(req, "]}");
+  httpd_resp_sendstr_chunk(req, NULL);
+  return ESP_OK;
+}
+
+static esp_err_t fileHandler(httpd_req_t *req) {
+  char name[64];
+  if (!g_sdReady || !queryName(req, name, sizeof(name))) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad request");
+    return ESP_FAIL;
+  }
+  char path[96];
+  snprintf(path, sizeof(path), "/motion/%s", name);
+  File f = SD_MMC.open(path);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+  httpd_resp_set_type(req, "image/jpeg");
+  char disp[96];
+  snprintf(disp, sizeof(disp), "attachment; filename=%s", name);
+  httpd_resp_set_hdr(req, "Content-Disposition", disp);
+
+  uint8_t buf[1024];
+  size_t r;
+  esp_err_t res = ESP_OK;
+  while ((r = f.read(buf, sizeof(buf))) > 0) {
+    if (httpd_resp_send_chunk(req, (const char *)buf, r) != ESP_OK) { res = ESP_FAIL; break; }
+  }
+  f.close();
+  if (res == ESP_OK) httpd_resp_send_chunk(req, NULL, 0);
+  return res;
+}
+
+static esp_err_t deleteHandler(httpd_req_t *req) {
+  char name[64];
+  if (!g_sdReady || !queryName(req, name, sizeof(name))) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad request");
+    return ESP_FAIL;
+  }
+  char path[96];
+  snprintf(path, sizeof(path), "/motion/%s", name);
+  bool ok = SD_MMC.remove(path);
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+// ---------------------------------------------------------------------------
 // MJPEG stream handler (port 81)
 // ---------------------------------------------------------------------------
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -517,7 +616,7 @@ static void registerUri(httpd_handle_t s, const char *path, httpd_method_t m,
 
 static void startServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 12;
+  config.max_uri_handlers = 16;
 
   if (httpd_start(&g_webServer, &config) == ESP_OK) {
     registerUri(g_webServer, "/", HTTP_GET, indexHandler);
@@ -527,6 +626,9 @@ static void startServers() {
     registerUri(g_webServer, "/save", HTTP_GET, saveHandler);
     registerUri(g_webServer, "/reset", HTTP_GET, resetHandler);
     registerUri(g_webServer, "/capture", HTTP_GET, captureHandler);
+    registerUri(g_webServer, "/list", HTTP_GET, listHandler);
+    registerUri(g_webServer, "/file", HTTP_GET, fileHandler);
+    registerUri(g_webServer, "/delete", HTTP_GET, deleteHandler);
   }
 
   config.server_port = 81;
