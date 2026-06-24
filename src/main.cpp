@@ -1,0 +1,421 @@
+// XIAO ESP32-S3 Sense - Underwater Motion Detector
+// -------------------------------------------------
+// - Grabs grayscale frames from the OV2640, detects motion via frame
+//   differencing.
+// - Drives two outputs while "active" (motion + adjustable hysteresis):
+//     * DIGITAL_OUT_PIN  -> HIGH while active, LOW when idle
+//     * SERVO_OUT_PIN    -> 2000us servo pulse while active, 1000us when idle
+// - Hosts a WiFi SoftAP with a tuning web page (port 80) and an MJPEG
+//   camera preview stream (port 81).
+// - All tunable parameters persist to NVS flash.
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Preferences.h>
+#include <esp_camera.h>
+#include <esp_http_server.h>
+
+#include "camera_pins.h"
+#include "web_index.h"
+
+// ---------------------------------------------------------------------------
+// Output pins (free XIAO header pins, clear of the camera/PSRAM/SD lines).
+//   D0 = GPIO1, D1 = GPIO2
+// ---------------------------------------------------------------------------
+static const int DIGITAL_OUT_PIN = 1;   // D0: digital "motion active" line
+static const int SERVO_OUT_PIN   = 2;   // D1: servo-style PWM line
+
+// LEDC (hardware PWM) config for the servo signal.
+static const int      SERVO_LEDC_CHANNEL = 4;       // avoid camera's LEDC ch0
+static const int      SERVO_LEDC_FREQ_HZ = 50;      // 20 ms servo frame
+static const int      SERVO_LEDC_BITS    = 14;      // max LEDC res at 50 Hz on S3
+static const uint32_t SERVO_PERIOD_US    = 20000;   // 1 / 50 Hz
+static const int      SERVO_PULSE_IDLE_US   = 1000;
+static const int      SERVO_PULSE_ACTIVE_US = 2000;
+
+// ---------------------------------------------------------------------------
+// SoftAP credentials
+// ---------------------------------------------------------------------------
+static const char *AP_SSID = "XIAO-Motion";
+static const char *AP_PASS = "underwater";   // >= 8 chars; change as desired
+
+// ---------------------------------------------------------------------------
+// Tunable settings (persisted to NVS)
+// ---------------------------------------------------------------------------
+struct Settings {
+  uint16_t pixelThreshold;     // per-pixel abs-diff that counts as "changed" (0-255)
+  uint16_t minChangedPermille; // tenths of a percent of sampled pixels to trigger
+  uint32_t hysteresisMs;       // hold time after last motion before releasing
+  uint16_t intervalMs;         // time between detection frames
+};
+
+static const Settings DEFAULTS = {
+  /*pixelThreshold*/    25,
+  /*minChangedPermille*/30,   // 3.0%
+  /*hysteresisMs*/      3000,
+  /*intervalMs*/        100,
+};
+
+static Settings g_set;
+static Preferences g_prefs;
+
+// ---------------------------------------------------------------------------
+// Runtime state
+// ---------------------------------------------------------------------------
+static uint8_t *g_prevFrame = nullptr;   // previous grayscale frame (PSRAM)
+static size_t   g_prevLen   = 0;
+static bool     g_haveStat  = false;
+
+static volatile bool     g_motion = false;   // motion in the latest frame
+static volatile bool     g_active = false;   // motion + hysteresis
+static volatile uint16_t g_changedPermille = 0;
+static uint32_t g_lastMotionMs = 0;
+static bool     g_motionSeen   = false;  // avoids a false "active" pulse at boot
+
+// Latest JPEG snapshot shared with the MJPEG stream task.
+static SemaphoreHandle_t g_jpgMutex = nullptr;
+static uint8_t *g_jpg = nullptr;
+static size_t   g_jpgLen = 0;
+
+static httpd_handle_t g_webServer = nullptr;
+static httpd_handle_t g_streamServer = nullptr;
+
+// ---------------------------------------------------------------------------
+// Servo / output helpers
+// ---------------------------------------------------------------------------
+static uint32_t pulseToDuty(uint32_t pulseUs) {
+  const uint32_t maxDuty = (1u << SERVO_LEDC_BITS) - 1u;
+  return (uint64_t)pulseUs * maxDuty / SERVO_PERIOD_US;
+}
+
+static void applyOutputs(bool active) {
+  digitalWrite(DIGITAL_OUT_PIN, active ? HIGH : LOW);
+  ledcWrite(SERVO_OUT_PIN,
+            pulseToDuty(active ? SERVO_PULSE_ACTIVE_US : SERVO_PULSE_IDLE_US));
+}
+
+// ---------------------------------------------------------------------------
+// Settings persistence
+// ---------------------------------------------------------------------------
+static void loadSettings() {
+  g_prefs.begin("motion", true);
+  g_set.pixelThreshold     = g_prefs.getUShort("pix", DEFAULTS.pixelThreshold);
+  g_set.minChangedPermille = g_prefs.getUShort("area", DEFAULTS.minChangedPermille);
+  g_set.hysteresisMs       = g_prefs.getULong("hyst", DEFAULTS.hysteresisMs);
+  g_set.intervalMs         = g_prefs.getUShort("iv", DEFAULTS.intervalMs);
+  g_prefs.end();
+}
+
+static void saveSettings() {
+  g_prefs.begin("motion", false);
+  g_prefs.putUShort("pix", g_set.pixelThreshold);
+  g_prefs.putUShort("area", g_set.minChangedPermille);
+  g_prefs.putULong("hyst", g_set.hysteresisMs);
+  g_prefs.putUShort("iv", g_set.intervalMs);
+  g_prefs.end();
+}
+
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+static bool initCamera() {
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_QVGA;        // 320x240
+  config.pixel_format = PIXFORMAT_GRAYSCALE; // 1 byte/pixel for diffing
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 2;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Motion detection on a grayscale frame
+// ---------------------------------------------------------------------------
+static void detectMotion(camera_fb_t *fb) {
+  const size_t len = fb->len;
+
+  if (g_prevFrame == nullptr || g_prevLen != len) {
+    if (g_prevFrame) free(g_prevFrame);
+    g_prevFrame = (uint8_t *)ps_malloc(len);
+    g_prevLen = len;
+    g_haveStat = false;
+  }
+
+  if (!g_haveStat) {
+    if (g_prevFrame) memcpy(g_prevFrame, fb->buf, len);
+    g_haveStat = true;
+    g_changedPermille = 0;
+    g_motion = false;
+    return;
+  }
+
+  // Sample every 4th pixel; plenty for whole-scene motion and much cheaper.
+  const size_t stride = 4;
+  const uint16_t thr = g_set.pixelThreshold;
+  size_t sampled = 0, changed = 0;
+  for (size_t i = 0; i < len; i += stride) {
+    int d = (int)fb->buf[i] - (int)g_prevFrame[i];
+    if (d < 0) d = -d;
+    if ((uint16_t)d >= thr) changed++;
+    sampled++;
+  }
+
+  memcpy(g_prevFrame, fb->buf, len);
+
+  uint16_t permille = sampled ? (uint16_t)((changed * 1000UL) / sampled) : 0;
+  g_changedPermille = permille;
+  g_motion = permille >= g_set.minChangedPermille;
+}
+
+// ---------------------------------------------------------------------------
+// Publish the latest frame as JPEG for the preview stream
+// ---------------------------------------------------------------------------
+static void publishJpeg(camera_fb_t *fb) {
+  uint8_t *out = nullptr;
+  size_t outLen = 0;
+  if (!frame2jpg(fb, 80, &out, &outLen)) return;
+
+  if (xSemaphoreTake(g_jpgMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (g_jpg) free(g_jpg);
+    g_jpg = out;
+    g_jpgLen = outLen;
+    xSemaphoreGive(g_jpgMutex);
+  } else {
+    free(out);  // could not publish this frame; drop it
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP handlers (port 80)
+// ---------------------------------------------------------------------------
+static esp_err_t indexHandler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t settingsHandler(httpd_req_t *req) {
+  char buf[256];
+  int n = snprintf(buf, sizeof(buf),
+    "{\"pixelThreshold\":%u,\"minChangedPermille\":%u,"
+    "\"hysteresisMs\":%lu,\"intervalMs\":%u}",
+    g_set.pixelThreshold, g_set.minChangedPermille,
+    (unsigned long)g_set.hysteresisMs, g_set.intervalMs);
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, buf, n);
+}
+
+static esp_err_t statusHandler(httpd_req_t *req) {
+  char buf[160];
+  int n = snprintf(buf, sizeof(buf),
+    "{\"motion\":%s,\"active\":%s,\"changedPermille\":%u}",
+    g_motion ? "true" : "false",
+    g_active ? "true" : "false",
+    g_changedPermille);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, buf, n);
+}
+
+static bool getQueryLong(httpd_req_t *req, const char *key, long *out) {
+  char query[128];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+  char val[32];
+  if (httpd_query_key_value(query, key, val, sizeof(val)) != ESP_OK) return false;
+  *out = strtol(val, nullptr, 10);
+  return true;
+}
+
+static esp_err_t setHandler(httpd_req_t *req) {
+  long v;
+  if (getQueryLong(req, "pixelThreshold", &v))
+    g_set.pixelThreshold = constrain(v, 1, 255);
+  if (getQueryLong(req, "minChangedPermille", &v))
+    g_set.minChangedPermille = constrain(v, 1, 1000);
+  if (getQueryLong(req, "hysteresisMs", &v))
+    g_set.hysteresisMs = constrain(v, 0, 120000);
+  if (getQueryLong(req, "intervalMs", &v))
+    g_set.intervalMs = constrain(v, 10, 5000);
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t saveHandler(httpd_req_t *req) {
+  saveSettings();
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t resetHandler(httpd_req_t *req) {
+  g_set = DEFAULTS;
+  saveSettings();
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t captureHandler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+  esp_err_t res = ESP_FAIL;
+  if (xSemaphoreTake(g_jpgMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (g_jpg && g_jpgLen) res = httpd_resp_send(req, (const char *)g_jpg, g_jpgLen);
+    xSemaphoreGive(g_jpgMutex);
+  }
+  if (res != ESP_OK) httpd_resp_send_500(req);
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// MJPEG stream handler (port 81)
+// ---------------------------------------------------------------------------
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char *STREAM_CONTENT_TYPE =
+  "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static esp_err_t streamHandler(httpd_req_t *req) {
+  esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  char partHeader[64];
+  while (true) {
+    uint8_t *copy = nullptr;
+    size_t copyLen = 0;
+
+    if (xSemaphoreTake(g_jpgMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      if (g_jpg && g_jpgLen) {
+        copy = (uint8_t *)malloc(g_jpgLen);
+        if (copy) { memcpy(copy, g_jpg, g_jpgLen); copyLen = g_jpgLen; }
+      }
+      xSemaphoreGive(g_jpgMutex);
+    }
+
+    if (copy) {
+      res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+      if (res == ESP_OK) {
+        int hl = snprintf(partHeader, sizeof(partHeader), STREAM_PART, copyLen);
+        res = httpd_resp_send_chunk(req, partHeader, hl);
+      }
+      if (res == ESP_OK)
+        res = httpd_resp_send_chunk(req, (const char *)copy, copyLen);
+      free(copy);
+      if (res != ESP_OK) break;  // client disconnected
+    }
+    vTaskDelay(pdMS_TO_TICKS(40));  // ~25 fps cap for the preview
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// Server setup
+// ---------------------------------------------------------------------------
+static void registerUri(httpd_handle_t s, const char *path, httpd_method_t m,
+                        esp_err_t (*fn)(httpd_req_t *)) {
+  httpd_uri_t uri = { path, m, fn, nullptr };
+  httpd_register_uri_handler(s, &uri);
+}
+
+static void startServers() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.max_uri_handlers = 12;
+
+  if (httpd_start(&g_webServer, &config) == ESP_OK) {
+    registerUri(g_webServer, "/", HTTP_GET, indexHandler);
+    registerUri(g_webServer, "/settings", HTTP_GET, settingsHandler);
+    registerUri(g_webServer, "/status", HTTP_GET, statusHandler);
+    registerUri(g_webServer, "/set", HTTP_GET, setHandler);
+    registerUri(g_webServer, "/save", HTTP_GET, saveHandler);
+    registerUri(g_webServer, "/reset", HTTP_GET, resetHandler);
+    registerUri(g_webServer, "/capture", HTTP_GET, captureHandler);
+  }
+
+  config.server_port = 81;
+  config.ctrl_port += 1;  // separate control socket for the stream server
+  if (httpd_start(&g_streamServer, &config) == ESP_OK) {
+    registerUri(g_streamServer, "/stream", HTTP_GET, streamHandler);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Setup / loop
+// ---------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\nXIAO ESP32-S3 Underwater Motion Detector");
+
+  pinMode(DIGITAL_OUT_PIN, OUTPUT);
+  digitalWrite(DIGITAL_OUT_PIN, LOW);
+  // arduino-esp32 3.x LEDC API: bind a fixed channel to the pin so we never
+  // collide with the camera's XCLK channel/timer.
+  ledcAttachChannel(SERVO_OUT_PIN, SERVO_LEDC_FREQ_HZ, SERVO_LEDC_BITS,
+                    SERVO_LEDC_CHANNEL);
+  applyOutputs(false);
+
+  loadSettings();
+  g_jpgMutex = xSemaphoreCreateMutex();
+
+  if (!initCamera()) {
+    Serial.println("Halting: camera unavailable.");
+    while (true) delay(1000);
+  }
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("SoftAP \"%s\" up. Open http://%s/\n", AP_SSID, ip.toString().c_str());
+
+  startServers();
+}
+
+void loop() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    delay(10);
+    return;
+  }
+
+  detectMotion(fb);
+  publishJpeg(fb);
+  esp_camera_fb_return(fb);
+
+  uint32_t now = millis();
+  if (g_motion) { g_lastMotionMs = now; g_motionSeen = true; }
+  bool active = g_motion ||
+                (g_motionSeen && (now - g_lastMotionMs < g_set.hysteresisMs));
+  if (active != g_active) {
+    g_active = active;
+    Serial.printf("[%lu] %s (changed %.1f%%)\n", (unsigned long)now,
+                  active ? "ACTIVE" : "idle", g_changedPermille / 10.0);
+  }
+  applyOutputs(active);
+
+  delay(g_set.intervalMs);
+}
