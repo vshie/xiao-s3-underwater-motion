@@ -50,6 +50,7 @@ struct Settings {
   uint16_t redGain;            // preview red level, percent (100 = unity)
   uint16_t greenGain;          // preview green level, percent
   uint16_t blueGain;           // preview blue level, percent
+  uint8_t  wbMode;             // sensor white-balance preset: 0 auto,1 sunny,2 cloudy,3 office,4 home
 };
 
 static const Settings DEFAULTS = {
@@ -60,6 +61,7 @@ static const Settings DEFAULTS = {
   /*redGain*/           100,
   /*greenGain*/         100,
   /*blueGain*/          100,
+  /*wbMode*/            0,    // auto
 };
 
 static Settings g_set;
@@ -112,6 +114,7 @@ static void loadSettings() {
   g_set.redGain            = g_prefs.getUShort("rg", DEFAULTS.redGain);
   g_set.greenGain          = g_prefs.getUShort("gg", DEFAULTS.greenGain);
   g_set.blueGain           = g_prefs.getUShort("bg", DEFAULTS.blueGain);
+  g_set.wbMode             = g_prefs.getUChar("wb", DEFAULTS.wbMode);
   g_prefs.end();
 }
 
@@ -124,6 +127,7 @@ static void saveSettings() {
   g_prefs.putUShort("rg", g_set.redGain);
   g_prefs.putUShort("gg", g_set.greenGain);
   g_prefs.putUShort("bg", g_set.blueGain);
+  g_prefs.putUChar("wb", g_set.wbMode);
   g_prefs.end();
 }
 
@@ -164,6 +168,16 @@ static bool initCamera() {
     return false;
   }
   return true;
+}
+
+// Push the white-balance preset to the OV2640. Mode 0 = auto; 1-4 are the
+// driver's fixed presets (sunny/cloudy/office/home), which require AWB gain on.
+static void applyWhiteBalance() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, g_set.wbMode);
 }
 
 // ---------------------------------------------------------------------------
@@ -270,10 +284,10 @@ static esp_err_t settingsHandler(httpd_req_t *req) {
   int n = snprintf(buf, sizeof(buf),
     "{\"pixelThreshold\":%u,\"minChangedPermille\":%u,"
     "\"hysteresisMs\":%lu,\"intervalMs\":%u,"
-    "\"redGain\":%u,\"greenGain\":%u,\"blueGain\":%u}",
+    "\"redGain\":%u,\"greenGain\":%u,\"blueGain\":%u,\"wbMode\":%u}",
     g_set.pixelThreshold, g_set.minChangedPermille,
     (unsigned long)g_set.hysteresisMs, g_set.intervalMs,
-    g_set.redGain, g_set.greenGain, g_set.blueGain);
+    g_set.redGain, g_set.greenGain, g_set.blueGain, g_set.wbMode);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, n);
 }
@@ -315,6 +329,10 @@ static esp_err_t setHandler(httpd_req_t *req) {
     g_set.greenGain = constrain(v, 0, 400);
   if (getQueryLong(req, "blueGain", &v))
     g_set.blueGain = constrain(v, 0, 400);
+  if (getQueryLong(req, "wbMode", &v)) {
+    g_set.wbMode = constrain(v, 0, 4);
+    applyWhiteBalance();
+  }
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
@@ -328,6 +346,7 @@ static esp_err_t saveHandler(httpd_req_t *req) {
 static esp_err_t resetHandler(httpd_req_t *req) {
   g_set = DEFAULTS;
   saveSettings();
+  applyWhiteBalance();
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
@@ -440,6 +459,7 @@ void setup() {
     Serial.println("Halting: camera unavailable.");
     while (true) delay(1000);
   }
+  applyWhiteBalance();
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);

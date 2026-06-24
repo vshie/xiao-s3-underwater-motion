@@ -34,6 +34,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .row label { display:flex; justify-content:space-between; font-size:13px; margin-bottom:6px; }
   .row label b { color:var(--accent); font-variant-numeric:tabular-nums; }
   input[type=range]{ width:100%; accent-color:var(--accent); }
+  select { width:100%; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:#0e1a26; color:var(--txt); font-size:13px; }
   .btns { display:flex; gap:10px; margin-top:6px; }
   button { flex:1; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0e1a26; color:var(--txt); font-size:13px; cursor:pointer; }
   button.primary { background:var(--accent); color:#04231d; border-color:var(--accent); font-weight:600; }
@@ -94,6 +95,23 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   </section>
 
   <section class="card">
+    <h2>White balance (sensor)</h2>
+    <div class="row">
+      <label>Mode</label>
+      <select id="wb">
+        <option value="0">Auto</option>
+        <option value="1">Sunny</option>
+        <option value="2">Cloudy</option>
+        <option value="3">Office</option>
+        <option value="4">Home</option>
+      </select>
+      <div class="hint">OV2640 hardware white-balance preset (applied at the sensor before
+        the software color levels below). "Auto" lets the sensor balance continuously;
+        a fixed preset can be steadier under constant lighting. Persisted with <b>Save to flash</b>.</div>
+    </div>
+  </section>
+
+  <section class="card">
     <h2>Color levels (preview)</h2>
     <div class="row">
       <label>Red <b id="v_r">--%</b></label>
@@ -143,6 +161,7 @@ async function loadSettings(){
   $('r').value = s.redGain;
   $('g').value = s.greenGain;
   $('b').value = s.blueGain;
+  $('wb').value = s.wbMode;
   paintSliderLabels();
 }
 
@@ -162,6 +181,10 @@ $('white').onclick = async () => {
   for (const id of ['r','g','b']){ $(id).value = 100; await pushSetting(keyMap[id], 100); }
   paintSliderLabels();
 };
+
+$('wb').addEventListener('change', async () => {
+  await pushSetting('wbMode', $('wb').value);
+});
 
 $('save').onclick = async () => {
   await fetch('/save'); $('savemsg').textContent = 'Saved to flash at '+new Date().toLocaleTimeString();
