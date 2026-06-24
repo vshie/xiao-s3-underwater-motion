@@ -118,32 +118,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         <option value="3">Office</option>
         <option value="4">Home</option>
       </select>
-      <div class="hint">OV2640 hardware white-balance preset (applied at the sensor before
-        the software color levels below). "Auto" lets the sensor balance continuously;
-        a fixed preset can be steadier under constant lighting. Persisted with <b>Save to flash</b>.</div>
+      <div class="hint">OV2640 hardware white-balance preset. "Auto" lets the sensor balance
+        continuously; a fixed preset can be steadier under constant lighting.
+        Persisted with <b>Save to flash</b>.</div>
     </div>
-  </section>
-
-  <section class="card">
-    <h2>Color levels (preview)</h2>
-    <div class="row">
-      <label>Red <b id="v_r">--%</b></label>
-      <input type="range" id="r" min="0" max="300" step="1">
-    </div>
-    <div class="row">
-      <label>Green <b id="v_g">--%</b></label>
-      <input type="range" id="g" min="0" max="300" step="1">
-    </div>
-    <div class="row">
-      <label>Blue <b id="v_b">--%</b></label>
-      <input type="range" id="b" min="0" max="300" step="1">
-    </div>
-    <div class="btns">
-      <button id="white">Neutral (100%)</button>
-    </div>
-    <div class="hint">Per-channel gain applied to the preview/snapshot (100% = unchanged).
-      Underwater, water absorbs red first, so raising Red often restores balance.
-      Use <b>Save to flash</b> above to persist. Motion detection is luminance-based and unaffected.</div>
   </section>
 
   <section class="card">
@@ -154,6 +132,18 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
     <label class="toggle"><input type="checkbox" id="sd"><span>Save images while motion is active</span></label>
     <div class="row" style="margin-top:14px">
+      <label>Save resolution</label>
+      <select id="sf">
+        <option value="0">SVGA 800x600</option>
+        <option value="1">XGA 1024x768</option>
+        <option value="2">SXGA 1280x1024</option>
+        <option value="3">UXGA 1600x1200 (max)</option>
+      </select>
+      <div class="hint">Resolution of saved snapshots. The live preview/detection run at low
+        resolution; the camera switches up only for each save. Higher resolutions draw more
+        power and pause the preview briefly during the save.</div>
+    </div>
+    <div class="row">
       <label>Capture interval <b id="v_ci">--</b></label>
       <input type="range" id="ci" min="100" max="10000" step="100">
       <div class="hint">Time between saved frames during an active period (one is always saved
@@ -179,10 +169,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 
 <script>
 const $ = id => document.getElementById(id);
-const sliders = { pix:'pix', area:'area', hyst:'hyst', iv:'iv', r:'r', g:'g', b:'b', ci:'ci' };
+const sliders = { pix:'pix', area:'area', hyst:'hyst', iv:'iv', ci:'ci' };
 const keyMap = { pix:'pixelThreshold', area:'minChangedPermille', hyst:'hysteresisMs',
-                 iv:'intervalMs', r:'redGain', g:'greenGain', b:'blueGain',
-                 ci:'captureIntervalMs' };
+                 iv:'intervalMs', ci:'captureIntervalMs' };
 
 function fmtMs(ms){ return ms >= 1000 ? (ms/1000).toFixed(1)+' s' : ms+' ms'; }
 
@@ -191,9 +180,6 @@ function paintSliderLabels(){
   $('v_area').textContent = ($('area').value/10).toFixed(1)+'%';
   $('v_hyst').textContent = fmtMs(+$('hyst').value);
   $('v_iv').textContent = $('iv').value+' ms';
-  $('v_r').textContent = $('r').value+'%';
-  $('v_g').textContent = $('g').value+'%';
-  $('v_b').textContent = $('b').value+'%';
   $('v_ci').textContent = fmtMs(+$('ci').value);
 }
 
@@ -203,11 +189,9 @@ async function loadSettings(){
   $('area').value = s.minChangedPermille;
   $('hyst').value = s.hysteresisMs;
   $('iv').value = s.intervalMs;
-  $('r').value = s.redGain;
-  $('g').value = s.greenGain;
-  $('b').value = s.blueGain;
   $('wb').value = s.wbMode;
   $('ci').value = s.captureIntervalMs;
+  $('sf').value = s.saveFrameSize;
   $('sd').checked = !!s.sdCapture;
   paintSliderLabels();
 }
@@ -224,13 +208,12 @@ Object.values(sliders).forEach(id => {
   });
 });
 
-$('white').onclick = async () => {
-  for (const id of ['r','g','b']){ $(id).value = 100; await pushSetting(keyMap[id], 100); }
-  paintSliderLabels();
-};
-
 $('wb').addEventListener('change', async () => {
   await pushSetting('wbMode', $('wb').value);
+});
+
+$('sf').addEventListener('change', async () => {
+  await pushSetting('saveFrameSize', $('sf').value);
 });
 
 $('sd').addEventListener('change', async () => {

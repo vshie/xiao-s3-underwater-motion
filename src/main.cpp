@@ -1,7 +1,10 @@
 // XIAO ESP32-S3 Sense - Underwater Motion Detector
 // -------------------------------------------------
-// - Grabs grayscale frames from the OV2640, detects motion via frame
-//   differencing.
+// - Camera runs in JPEG mode. Detection + preview use a low resolution
+//   (QVGA); the OV2640 is briefly switched up to a high resolution (default
+//   UXGA 1600x1200) to save full-quality snapshots to SD.
+// - Motion detection: each low-res JPEG is decoded to grayscale and frame-
+//   differenced against the previous frame.
 // - Drives two outputs while "active" (motion + adjustable hysteresis):
 //     * DIGITAL_OUT_PIN  -> HIGH while active, LOW when idle
 //     * SERVO_OUT_PIN    -> 2000us servo pulse while active, 1000us when idle
@@ -14,6 +17,7 @@
 #include <Preferences.h>
 #include <esp_camera.h>
 #include <esp_http_server.h>
+#include <img_converters.h>
 #include <FS.h>
 #include <SD_MMC.h>
 
@@ -55,12 +59,10 @@ struct Settings {
   uint16_t minChangedPermille; // tenths of a percent of sampled pixels to trigger
   uint32_t hysteresisMs;       // hold time after last motion before releasing
   uint16_t intervalMs;         // time between detection frames
-  uint16_t redGain;            // preview red level, percent (100 = unity)
-  uint16_t greenGain;          // preview green level, percent
-  uint16_t blueGain;           // preview blue level, percent
   uint8_t  wbMode;             // sensor white-balance preset: 0 auto,1 sunny,2 cloudy,3 office,4 home
   uint8_t  sdCapture;          // 1 = save JPEGs to SD during active periods
   uint16_t captureIntervalMs;  // min time between saved frames while active
+  uint8_t  saveFrameSize;      // SD save resolution: 0 SVGA,1 XGA,2 SXGA,3 UXGA
 };
 
 static const Settings DEFAULTS = {
@@ -68,22 +70,30 @@ static const Settings DEFAULTS = {
   /*minChangedPermille*/30,   // 3.0%
   /*hysteresisMs*/      3000,
   /*intervalMs*/        100,
-  /*redGain*/           100,
-  /*greenGain*/         100,
-  /*blueGain*/          100,
   /*wbMode*/            0,    // auto
   /*sdCapture*/         0,    // off until enabled
   /*captureIntervalMs*/ 1000, // 1 frame/sec while active
+  /*saveFrameSize*/     3,    // UXGA 1600x1200
 };
 
 static Settings g_set;
 static Preferences g_prefs;
 
 // ---------------------------------------------------------------------------
+// Detection geometry
+// ---------------------------------------------------------------------------
+// Sensor outputs QVGA for detection/preview; we decode each JPEG at 1/2 scale
+// (160x120 grayscale) for cheap frame differencing.
+static const framesize_t DETECT_FRAMESIZE = FRAMESIZE_QVGA;
+static const int    DEC_W   = 160;
+static const int    DEC_H   = 120;
+static const size_t DEC_PIX = (size_t)DEC_W * DEC_H;
+
+// ---------------------------------------------------------------------------
 // Runtime state
 // ---------------------------------------------------------------------------
-static uint8_t *g_prevFrame = nullptr;   // previous grayscale frame (PSRAM)
-static size_t   g_prevLen   = 0;
+static uint8_t *g_rgbBuf    = nullptr;   // decoded RGB565 scratch (DEC_PIX*2)
+static uint8_t *g_prevFrame = nullptr;   // previous grayscale frame (DEC_PIX)
 static bool     g_haveStat  = false;
 
 static volatile bool     g_motion = false;   // motion in the latest frame
@@ -131,12 +141,10 @@ static void loadSettings() {
   g_set.minChangedPermille = g_prefs.getUShort("area", DEFAULTS.minChangedPermille);
   g_set.hysteresisMs       = g_prefs.getULong("hyst", DEFAULTS.hysteresisMs);
   g_set.intervalMs         = g_prefs.getUShort("iv", DEFAULTS.intervalMs);
-  g_set.redGain            = g_prefs.getUShort("rg", DEFAULTS.redGain);
-  g_set.greenGain          = g_prefs.getUShort("gg", DEFAULTS.greenGain);
-  g_set.blueGain           = g_prefs.getUShort("bg", DEFAULTS.blueGain);
   g_set.wbMode             = g_prefs.getUChar("wb", DEFAULTS.wbMode);
   g_set.sdCapture          = g_prefs.getUChar("sd", DEFAULTS.sdCapture);
   g_set.captureIntervalMs  = g_prefs.getUShort("ci", DEFAULTS.captureIntervalMs);
+  g_set.saveFrameSize      = g_prefs.getUChar("sf", DEFAULTS.saveFrameSize);
   g_prefs.end();
 }
 
@@ -146,12 +154,10 @@ static void saveSettings() {
   g_prefs.putUShort("area", g_set.minChangedPermille);
   g_prefs.putULong("hyst", g_set.hysteresisMs);
   g_prefs.putUShort("iv", g_set.intervalMs);
-  g_prefs.putUShort("rg", g_set.redGain);
-  g_prefs.putUShort("gg", g_set.greenGain);
-  g_prefs.putUShort("bg", g_set.blueGain);
   g_prefs.putUChar("wb", g_set.wbMode);
   g_prefs.putUChar("sd", g_set.sdCapture);
   g_prefs.putUShort("ci", g_set.captureIntervalMs);
+  g_prefs.putUChar("sf", g_set.saveFrameSize);
   g_prefs.end();
 }
 
@@ -179,8 +185,11 @@ static bool initCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA;        // 320x240
-  config.pixel_format = PIXFORMAT_RGB565;    // color preview; luma derived for diffing
+  config.pixel_format = PIXFORMAT_JPEG;
+  // Initialize at the largest size we will ever capture so the driver
+  // allocates big-enough buffers; we run detection/preview at a smaller size
+  // and only switch up momentarily for high-res saves.
+  config.frame_size = FRAMESIZE_UXGA;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
@@ -191,7 +200,29 @@ static bool initCamera() {
     Serial.printf("Camera init failed: 0x%x\n", err);
     return false;
   }
+
+  // Drop to the detection/preview resolution for normal operation.
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) s->set_framesize(s, DETECT_FRAMESIZE);
+
+  // Scratch buffers for JPEG-decode-based motion detection (in PSRAM).
+  g_rgbBuf = (uint8_t *)ps_malloc(DEC_PIX * 2);
+  g_prevFrame = (uint8_t *)ps_malloc(DEC_PIX);
+  if (!g_rgbBuf || !g_prevFrame) {
+    Serial.println("Camera: failed to allocate detection buffers");
+    return false;
+  }
   return true;
+}
+
+// Map the saved-resolution setting to a sensor framesize.
+static framesize_t saveFramesize() {
+  switch (g_set.saveFrameSize) {
+    case 0:  return FRAMESIZE_SVGA;   // 800x600
+    case 1:  return FRAMESIZE_XGA;    // 1024x768
+    case 2:  return FRAMESIZE_SXGA;   // 1280x1024
+    default: return FRAMESIZE_UXGA;   // 1600x1200
+  }
 }
 
 // Push the white-balance preset to the OV2640. Mode 0 = auto; 1-4 are the
@@ -217,32 +248,25 @@ static inline uint8_t rgb565Luma(uint8_t hb, uint8_t lb) {
 }
 
 static void detectMotion(camera_fb_t *fb) {
-  // RGB565 -> one luma byte per pixel for the reference frame.
-  const size_t numPixels = fb->len / 2;
+  if (!g_rgbBuf || !g_prevFrame) return;
+  // Decode the low-res JPEG at 1/2 scale into RGB565 (160x120), then diff luma.
+  if (!jpg2rgb565(fb->buf, fb->len, g_rgbBuf, JPG_SCALE_2X)) return;
 
-  if (g_prevFrame == nullptr || g_prevLen != numPixels) {
-    if (g_prevFrame) free(g_prevFrame);
-    g_prevFrame = (uint8_t *)ps_malloc(numPixels);
-    g_prevLen = numPixels;
-    g_haveStat = false;
-  }
-
-  // Sample every 4th pixel; plenty for whole-scene motion and much cheaper.
-  const size_t stride = 4;
+  const size_t stride = 2;
   const uint16_t thr = g_set.pixelThreshold;
-  size_t sampled = 0, changed = 0;
 
   if (!g_haveStat) {
-    for (size_t p = 0; p < numPixels; p += stride)
-      g_prevFrame[p] = rgb565Luma(fb->buf[p * 2], fb->buf[p * 2 + 1]);
+    for (size_t p = 0; p < DEC_PIX; p += stride)
+      g_prevFrame[p] = rgb565Luma(g_rgbBuf[p * 2], g_rgbBuf[p * 2 + 1]);
     g_haveStat = true;
     g_changedPermille = 0;
     g_motion = false;
     return;
   }
 
-  for (size_t p = 0; p < numPixels; p += stride) {
-    uint8_t luma = rgb565Luma(fb->buf[p * 2], fb->buf[p * 2 + 1]);
+  size_t sampled = 0, changed = 0;
+  for (size_t p = 0; p < DEC_PIX; p += stride) {
+    uint8_t luma = rgb565Luma(g_rgbBuf[p * 2], g_rgbBuf[p * 2 + 1]);
     int d = (int)luma - (int)g_prevFrame[p];
     if (d < 0) d = -d;
     if ((uint16_t)d >= thr) changed++;
@@ -256,39 +280,18 @@ static void detectMotion(camera_fb_t *fb) {
 }
 
 // ---------------------------------------------------------------------------
-// Publish the latest frame as JPEG for the preview stream
+// Publish the latest low-res JPEG for the preview stream (camera already
+// outputs JPEG, so just copy it into the shared buffer).
 // ---------------------------------------------------------------------------
-// Apply per-channel gain to an RGB565 frame in place. Detection has already
-// consumed this buffer (luma), so it is safe to modify before JPEG encoding.
-static void applyColorGain(camera_fb_t *fb) {
-  const uint16_t rg = g_set.redGain, gg = g_set.greenGain, bg = g_set.blueGain;
-  if (rg == 100 && gg == 100 && bg == 100) return;  // unity: nothing to do
-
-  for (size_t i = 0; i + 1 < fb->len; i += 2) {
-    uint8_t hb = fb->buf[i], lb = fb->buf[i + 1];
-    uint16_t r5 = (hb >> 3) & 0x1F;
-    uint16_t g6 = ((hb & 0x07) << 3) | (lb >> 5);
-    uint16_t b5 = lb & 0x1F;
-
-    r5 = (uint16_t)((r5 * rg) / 100); if (r5 > 31) r5 = 31;
-    g6 = (uint16_t)((g6 * gg) / 100); if (g6 > 63) g6 = 63;
-    b5 = (uint16_t)((b5 * bg) / 100); if (b5 > 31) b5 = 31;
-
-    fb->buf[i]     = (uint8_t)((r5 << 3) | (g6 >> 3));
-    fb->buf[i + 1] = (uint8_t)(((g6 & 0x07) << 5) | b5);
-  }
-}
-
-static void publishJpeg(camera_fb_t *fb) {
-  applyColorGain(fb);
-  uint8_t *out = nullptr;
-  size_t outLen = 0;
-  if (!frame2jpg(fb, 80, &out, &outLen)) return;
+static void publishPreview(camera_fb_t *fb) {
+  uint8_t *out = (uint8_t *)malloc(fb->len);
+  if (!out) return;
+  memcpy(out, fb->buf, fb->len);
 
   if (xSemaphoreTake(g_jpgMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     if (g_jpg) free(g_jpg);
     g_jpg = out;
-    g_jpgLen = outLen;
+    g_jpgLen = fb->len;
     xSemaphoreGive(g_jpgMutex);
   } else {
     free(out);  // could not publish this frame; drop it
@@ -332,40 +335,50 @@ static bool initSD() {
   return true;
 }
 
+// Capture one high-resolution frame and write it to SD. Runs in the loop task
+// (the only camera user), so it can safely switch the sensor framesize up for
+// the grab and back down afterwards. Detection/preview pause for the duration.
 static void saveImageToSD() {
   if (!g_sdReady) return;
 
-  // Copy the latest JPEG out from under the stream mutex, then write to SD.
-  uint8_t *copy = nullptr;
-  size_t   copyLen = 0;
-  if (xSemaphoreTake(g_jpgMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    if (g_jpg && g_jpgLen) {
-      copy = (uint8_t *)malloc(g_jpgLen);
-      if (copy) { memcpy(copy, g_jpg, g_jpgLen); copyLen = g_jpgLen; }
+  // If a download/listing is in progress, skip rather than touch the card
+  // concurrently or block the main loop for long.
+  if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(80)) != pdTRUE) return;
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, saveFramesize());
+    // Discard a couple of frames so the sensor settles at the new resolution.
+    for (int i = 0; i < 2; i++) {
+      camera_fb_t *d = esp_camera_fb_get();
+      if (d) esp_camera_fb_return(d);
     }
-    xSemaphoreGive(g_jpgMutex);
   }
-  if (!copy) return;
 
-  // If a download/listing is in progress, skip this save rather than block
-  // the main loop (and never touch the card concurrently).
-  if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(80)) != pdTRUE) { free(copy); return; }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (fb) {
+    char path[40];
+    snprintf(path, sizeof(path), "/motion/m%lu_%05lu.jpg",
+             (unsigned long)g_bootId, (unsigned long)g_imgIndex);
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (f) {
+      f.write(fb->buf, fb->len);
+      f.close();
+      g_imgIndex++;
+      g_imgSaved++;
+    } else {
+      Serial.printf("SD: failed to open %s\n", path);
+      g_sdReady = false;  // card likely pulled; stop trying until reboot
+    }
+    esp_camera_fb_return(fb);
+  }
 
-  char path[40];
-  snprintf(path, sizeof(path), "/motion/m%lu_%05lu.jpg",
-           (unsigned long)g_bootId, (unsigned long)g_imgIndex);
-  File f = SD_MMC.open(path, FILE_WRITE);
-  if (f) {
-    f.write(copy, copyLen);
-    f.close();
-    g_imgIndex++;
-    g_imgSaved++;
-  } else {
-    Serial.printf("SD: failed to open %s\n", path);
-    g_sdReady = false;  // card likely pulled; stop trying until reboot
+  if (s) {
+    s->set_framesize(s, DETECT_FRAMESIZE);
+    camera_fb_t *d = esp_camera_fb_get();  // flush one transitional frame
+    if (d) esp_camera_fb_return(d);
   }
   xSemaphoreGive(g_sdMutex);
-  free(copy);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,13 +393,11 @@ static esp_err_t settingsHandler(httpd_req_t *req) {
   char buf[256];
   int n = snprintf(buf, sizeof(buf),
     "{\"pixelThreshold\":%u,\"minChangedPermille\":%u,"
-    "\"hysteresisMs\":%lu,\"intervalMs\":%u,"
-    "\"redGain\":%u,\"greenGain\":%u,\"blueGain\":%u,\"wbMode\":%u,"
-    "\"sdCapture\":%u,\"captureIntervalMs\":%u}",
+    "\"hysteresisMs\":%lu,\"intervalMs\":%u,\"wbMode\":%u,"
+    "\"sdCapture\":%u,\"captureIntervalMs\":%u,\"saveFrameSize\":%u}",
     g_set.pixelThreshold, g_set.minChangedPermille,
-    (unsigned long)g_set.hysteresisMs, g_set.intervalMs,
-    g_set.redGain, g_set.greenGain, g_set.blueGain, g_set.wbMode,
-    g_set.sdCapture, g_set.captureIntervalMs);
+    (unsigned long)g_set.hysteresisMs, g_set.intervalMs, g_set.wbMode,
+    g_set.sdCapture, g_set.captureIntervalMs, g_set.saveFrameSize);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, n);
 }
@@ -425,12 +436,6 @@ static esp_err_t setHandler(httpd_req_t *req) {
     g_set.hysteresisMs = constrain(v, 0, 120000);
   if (getQueryLong(req, "intervalMs", &v))
     g_set.intervalMs = constrain(v, 10, 5000);
-  if (getQueryLong(req, "redGain", &v))
-    g_set.redGain = constrain(v, 0, 400);
-  if (getQueryLong(req, "greenGain", &v))
-    g_set.greenGain = constrain(v, 0, 400);
-  if (getQueryLong(req, "blueGain", &v))
-    g_set.blueGain = constrain(v, 0, 400);
   if (getQueryLong(req, "wbMode", &v)) {
     g_set.wbMode = constrain(v, 0, 4);
     applyWhiteBalance();
@@ -439,6 +444,8 @@ static esp_err_t setHandler(httpd_req_t *req) {
     g_set.sdCapture = v ? 1 : 0;
   if (getQueryLong(req, "captureIntervalMs", &v))
     g_set.captureIntervalMs = constrain(v, 100, 60000);
+  if (getQueryLong(req, "saveFrameSize", &v))
+    g_set.saveFrameSize = constrain(v, 0, 3);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
@@ -715,7 +722,7 @@ void loop() {
   }
 
   detectMotion(fb);
-  publishJpeg(fb);
+  publishPreview(fb);
   esp_camera_fb_return(fb);
 
   uint32_t now = millis();
