@@ -42,6 +42,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .hint { font-size:11px; color:var(--mut); margin-top:8px; line-height:1.5; }
   .pill { font-size:11px; padding:2px 8px; border-radius:20px; border:1px solid var(--line); color:var(--mut); }
   .pill.hi { color:var(--accent); border-color:var(--accent); }
+  .toggle { display:flex; align-items:center; gap:10px; font-size:13px; cursor:pointer; }
+  .toggle input { width:18px; height:18px; accent-color:var(--accent); }
+  code { background:#0e1a26; padding:1px 5px; border-radius:4px; font-size:12px; }
 </style>
 </head>
 <body>
@@ -132,13 +135,30 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       Underwater, water absorbs red first, so raising Red often restores balance.
       Use <b>Save to flash</b> above to persist. Motion detection is luminance-based and unaffected.</div>
   </section>
+
+  <section class="card">
+    <h2>SD card capture</h2>
+    <div class="stat-grid">
+      <div class="stat"><div class="k">Card</div><div class="v" id="s_sd">--</div></div>
+      <div class="stat"><div class="k">Images saved</div><div class="v" id="s_sdimg">--</div></div>
+    </div>
+    <label class="toggle"><input type="checkbox" id="sd"><span>Save images while motion is active</span></label>
+    <div class="row" style="margin-top:14px">
+      <label>Capture interval <b id="v_ci">--</b></label>
+      <input type="range" id="ci" min="100" max="10000" step="100">
+      <div class="hint">Time between saved frames during an active period (one is always saved
+        at the moment motion starts). Files go to <code>/motion/</code> as JPEGs.
+        Enable + <b>Save to flash</b> to persist across reboots.</div>
+    </div>
+  </section>
 </main>
 
 <script>
 const $ = id => document.getElementById(id);
-const sliders = { pix:'pix', area:'area', hyst:'hyst', iv:'iv', r:'r', g:'g', b:'b' };
+const sliders = { pix:'pix', area:'area', hyst:'hyst', iv:'iv', r:'r', g:'g', b:'b', ci:'ci' };
 const keyMap = { pix:'pixelThreshold', area:'minChangedPermille', hyst:'hysteresisMs',
-                 iv:'intervalMs', r:'redGain', g:'greenGain', b:'blueGain' };
+                 iv:'intervalMs', r:'redGain', g:'greenGain', b:'blueGain',
+                 ci:'captureIntervalMs' };
 
 function fmtMs(ms){ return ms >= 1000 ? (ms/1000).toFixed(1)+' s' : ms+' ms'; }
 
@@ -150,6 +170,7 @@ function paintSliderLabels(){
   $('v_r').textContent = $('r').value+'%';
   $('v_g').textContent = $('g').value+'%';
   $('v_b').textContent = $('b').value+'%';
+  $('v_ci').textContent = fmtMs(+$('ci').value);
 }
 
 async function loadSettings(){
@@ -162,6 +183,8 @@ async function loadSettings(){
   $('g').value = s.greenGain;
   $('b').value = s.blueGain;
   $('wb').value = s.wbMode;
+  $('ci').value = s.captureIntervalMs;
+  $('sd').checked = !!s.sdCapture;
   paintSliderLabels();
 }
 
@@ -186,6 +209,10 @@ $('wb').addEventListener('change', async () => {
   await pushSetting('wbMode', $('wb').value);
 });
 
+$('sd').addEventListener('change', async () => {
+  await pushSetting('sdCapture', $('sd').checked ? 1 : 0);
+});
+
 $('save').onclick = async () => {
   await fetch('/save'); $('savemsg').textContent = 'Saved to flash at '+new Date().toLocaleTimeString();
 };
@@ -203,6 +230,8 @@ async function poll(){
     $('s_changed_bar').style.width = Math.min(100, s.changedPermille/10)+'%';
     $('s_dout').textContent = s.active ? 'HIGH' : 'LOW';
     $('s_servo').textContent = (s.active ? 2000 : 1000)+' us';
+    $('s_sd').textContent = s.sdReady ? 'mounted' : 'not detected';
+    $('s_sdimg').textContent = s.sdImages;
   } catch(e){
     $('conn').textContent = 'offline'; $('conn').classList.remove('hi');
   }

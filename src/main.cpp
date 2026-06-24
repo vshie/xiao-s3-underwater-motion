@@ -14,9 +14,17 @@
 #include <Preferences.h>
 #include <esp_camera.h>
 #include <esp_http_server.h>
+#include <FS.h>
+#include <SD_MMC.h>
 
 #include "camera_pins.h"
 #include "web_index.h"
+
+// XIAO ESP32-S3 Sense onboard microSD slot, driven over SD_MMC in 1-bit mode.
+// (Official Seeed camera-example mapping; coexists with the camera.)
+static const int SD_CLK_PIN = 7;
+static const int SD_CMD_PIN = 9;
+static const int SD_D0_PIN  = 8;
 
 // ---------------------------------------------------------------------------
 // Output pins (free XIAO header pins, clear of the camera/PSRAM/SD lines).
@@ -51,6 +59,8 @@ struct Settings {
   uint16_t greenGain;          // preview green level, percent
   uint16_t blueGain;           // preview blue level, percent
   uint8_t  wbMode;             // sensor white-balance preset: 0 auto,1 sunny,2 cloudy,3 office,4 home
+  uint8_t  sdCapture;          // 1 = save JPEGs to SD during active periods
+  uint16_t captureIntervalMs;  // min time between saved frames while active
 };
 
 static const Settings DEFAULTS = {
@@ -62,6 +72,8 @@ static const Settings DEFAULTS = {
   /*greenGain*/         100,
   /*blueGain*/          100,
   /*wbMode*/            0,    // auto
+  /*sdCapture*/         0,    // off until enabled
+  /*captureIntervalMs*/ 1000, // 1 frame/sec while active
 };
 
 static Settings g_set;
@@ -84,6 +96,13 @@ static bool     g_motionSeen   = false;  // avoids a false "active" pulse at boo
 static SemaphoreHandle_t g_jpgMutex = nullptr;
 static uint8_t *g_jpg = nullptr;
 static size_t   g_jpgLen = 0;
+
+// SD card state
+static bool     g_sdReady   = false;
+static uint32_t g_bootId    = 0;   // unique per power-up, used in filenames
+static uint32_t g_imgIndex  = 0;   // frame counter within this boot
+static uint32_t g_imgSaved  = 0;   // images written this session
+static uint32_t g_lastSaveMs = 0;
 
 static httpd_handle_t g_webServer = nullptr;
 static httpd_handle_t g_streamServer = nullptr;
@@ -115,6 +134,8 @@ static void loadSettings() {
   g_set.greenGain          = g_prefs.getUShort("gg", DEFAULTS.greenGain);
   g_set.blueGain           = g_prefs.getUShort("bg", DEFAULTS.blueGain);
   g_set.wbMode             = g_prefs.getUChar("wb", DEFAULTS.wbMode);
+  g_set.sdCapture          = g_prefs.getUChar("sd", DEFAULTS.sdCapture);
+  g_set.captureIntervalMs  = g_prefs.getUShort("ci", DEFAULTS.captureIntervalMs);
   g_prefs.end();
 }
 
@@ -128,6 +149,8 @@ static void saveSettings() {
   g_prefs.putUShort("gg", g_set.greenGain);
   g_prefs.putUShort("bg", g_set.blueGain);
   g_prefs.putUChar("wb", g_set.wbMode);
+  g_prefs.putUChar("sd", g_set.sdCapture);
+  g_prefs.putUShort("ci", g_set.captureIntervalMs);
   g_prefs.end();
 }
 
@@ -272,6 +295,74 @@ static void publishJpeg(camera_fb_t *fb) {
 }
 
 // ---------------------------------------------------------------------------
+// SD card (SD_MMC, 1-bit)
+// ---------------------------------------------------------------------------
+static bool initSD() {
+  if (!SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN)) {
+    Serial.println("SD: setPins failed");
+    return false;
+  }
+  // Try 1-bit mode at default speed, then fall back to the slow probing clock
+  // (helps large/picky cards initialize).
+  bool ok = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+  if (!ok) ok = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_PROBING);
+  if (!ok) {
+    Serial.println("SD: mount failed (no card / not FAT32 / unsupported)");
+    return false;
+  }
+
+  uint8_t type = SD_MMC.cardType();
+  if (type == CARD_NONE) {
+    Serial.println("SD: no card detected");
+    return false;
+  }
+  SD_MMC.mkdir("/motion");
+
+  // One NVS write per boot gives every power-up a unique filename prefix.
+  g_prefs.begin("motion", false);
+  g_bootId = g_prefs.getULong("boot", 0) + 1;
+  g_prefs.putULong("boot", g_bootId);
+  g_prefs.end();
+
+  Serial.printf("SD: mounted, %llu MB total, %llu MB free (bootId %lu)\n",
+                SD_MMC.totalBytes() / (1024ULL * 1024ULL),
+                (SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL),
+                (unsigned long)g_bootId);
+  return true;
+}
+
+static void saveImageToSD() {
+  if (!g_sdReady) return;
+
+  // Copy the latest JPEG out from under the stream mutex, then write to SD.
+  uint8_t *copy = nullptr;
+  size_t   copyLen = 0;
+  if (xSemaphoreTake(g_jpgMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (g_jpg && g_jpgLen) {
+      copy = (uint8_t *)malloc(g_jpgLen);
+      if (copy) { memcpy(copy, g_jpg, g_jpgLen); copyLen = g_jpgLen; }
+    }
+    xSemaphoreGive(g_jpgMutex);
+  }
+  if (!copy) return;
+
+  char path[40];
+  snprintf(path, sizeof(path), "/motion/m%lu_%05lu.jpg",
+           (unsigned long)g_bootId, (unsigned long)g_imgIndex);
+  File f = SD_MMC.open(path, FILE_WRITE);
+  if (f) {
+    f.write(copy, copyLen);
+    f.close();
+    g_imgIndex++;
+    g_imgSaved++;
+  } else {
+    Serial.printf("SD: failed to open %s\n", path);
+    g_sdReady = false;  // card likely pulled; stop trying until reboot
+  }
+  free(copy);
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handlers (port 80)
 // ---------------------------------------------------------------------------
 static esp_err_t indexHandler(httpd_req_t *req) {
@@ -284,21 +375,26 @@ static esp_err_t settingsHandler(httpd_req_t *req) {
   int n = snprintf(buf, sizeof(buf),
     "{\"pixelThreshold\":%u,\"minChangedPermille\":%u,"
     "\"hysteresisMs\":%lu,\"intervalMs\":%u,"
-    "\"redGain\":%u,\"greenGain\":%u,\"blueGain\":%u,\"wbMode\":%u}",
+    "\"redGain\":%u,\"greenGain\":%u,\"blueGain\":%u,\"wbMode\":%u,"
+    "\"sdCapture\":%u,\"captureIntervalMs\":%u}",
     g_set.pixelThreshold, g_set.minChangedPermille,
     (unsigned long)g_set.hysteresisMs, g_set.intervalMs,
-    g_set.redGain, g_set.greenGain, g_set.blueGain, g_set.wbMode);
+    g_set.redGain, g_set.greenGain, g_set.blueGain, g_set.wbMode,
+    g_set.sdCapture, g_set.captureIntervalMs);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, n);
 }
 
 static esp_err_t statusHandler(httpd_req_t *req) {
-  char buf[160];
+  char buf[200];
   int n = snprintf(buf, sizeof(buf),
-    "{\"motion\":%s,\"active\":%s,\"changedPermille\":%u}",
+    "{\"motion\":%s,\"active\":%s,\"changedPermille\":%u,"
+    "\"sdReady\":%s,\"sdImages\":%lu}",
     g_motion ? "true" : "false",
     g_active ? "true" : "false",
-    g_changedPermille);
+    g_changedPermille,
+    g_sdReady ? "true" : "false",
+    (unsigned long)g_imgSaved);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_send(req, buf, n);
@@ -333,6 +429,10 @@ static esp_err_t setHandler(httpd_req_t *req) {
     g_set.wbMode = constrain(v, 0, 4);
     applyWhiteBalance();
   }
+  if (getQueryLong(req, "sdCapture", &v))
+    g_set.sdCapture = v ? 1 : 0;
+  if (getQueryLong(req, "captureIntervalMs", &v))
+    g_set.captureIntervalMs = constrain(v, 100, 60000);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
@@ -461,6 +561,9 @@ void setup() {
   }
   applyWhiteBalance();
 
+  g_sdReady = initSD();
+  if (!g_sdReady) Serial.println("SD capture disabled (card not available).");
+
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   IPAddress ip = WiFi.softAPIP();
@@ -484,12 +587,22 @@ void loop() {
   if (g_motion) { g_lastMotionMs = now; g_motionSeen = true; }
   bool active = g_motion ||
                 (g_motionSeen && (now - g_lastMotionMs < g_set.hysteresisMs));
+  bool rising = active && !g_active;
   if (active != g_active) {
     g_active = active;
     Serial.printf("[%lu] %s (changed %.1f%%)\n", (unsigned long)now,
                   active ? "ACTIVE" : "idle", g_changedPermille / 10.0);
   }
   applyOutputs(active);
+
+  // Capture to SD throughout the active period: once on the rising edge, then
+  // every captureIntervalMs while still active.
+  if (active && g_set.sdCapture && g_sdReady) {
+    if (rising || (now - g_lastSaveMs >= g_set.captureIntervalMs)) {
+      saveImageToSD();
+      g_lastSaveMs = now;
+    }
+  }
 
   delay(g_set.intervalMs);
 }
