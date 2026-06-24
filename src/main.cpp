@@ -47,6 +47,9 @@ struct Settings {
   uint16_t minChangedPermille; // tenths of a percent of sampled pixels to trigger
   uint32_t hysteresisMs;       // hold time after last motion before releasing
   uint16_t intervalMs;         // time between detection frames
+  uint16_t redGain;            // preview red level, percent (100 = unity)
+  uint16_t greenGain;          // preview green level, percent
+  uint16_t blueGain;           // preview blue level, percent
 };
 
 static const Settings DEFAULTS = {
@@ -54,6 +57,9 @@ static const Settings DEFAULTS = {
   /*minChangedPermille*/30,   // 3.0%
   /*hysteresisMs*/      3000,
   /*intervalMs*/        100,
+  /*redGain*/           100,
+  /*greenGain*/         100,
+  /*blueGain*/          100,
 };
 
 static Settings g_set;
@@ -103,6 +109,9 @@ static void loadSettings() {
   g_set.minChangedPermille = g_prefs.getUShort("area", DEFAULTS.minChangedPermille);
   g_set.hysteresisMs       = g_prefs.getULong("hyst", DEFAULTS.hysteresisMs);
   g_set.intervalMs         = g_prefs.getUShort("iv", DEFAULTS.intervalMs);
+  g_set.redGain            = g_prefs.getUShort("rg", DEFAULTS.redGain);
+  g_set.greenGain          = g_prefs.getUShort("gg", DEFAULTS.greenGain);
+  g_set.blueGain           = g_prefs.getUShort("bg", DEFAULTS.blueGain);
   g_prefs.end();
 }
 
@@ -112,6 +121,9 @@ static void saveSettings() {
   g_prefs.putUShort("area", g_set.minChangedPermille);
   g_prefs.putULong("hyst", g_set.hysteresisMs);
   g_prefs.putUShort("iv", g_set.intervalMs);
+  g_prefs.putUShort("rg", g_set.redGain);
+  g_prefs.putUShort("gg", g_set.greenGain);
+  g_prefs.putUShort("bg", g_set.blueGain);
   g_prefs.end();
 }
 
@@ -208,7 +220,29 @@ static void detectMotion(camera_fb_t *fb) {
 // ---------------------------------------------------------------------------
 // Publish the latest frame as JPEG for the preview stream
 // ---------------------------------------------------------------------------
+// Apply per-channel gain to an RGB565 frame in place. Detection has already
+// consumed this buffer (luma), so it is safe to modify before JPEG encoding.
+static void applyColorGain(camera_fb_t *fb) {
+  const uint16_t rg = g_set.redGain, gg = g_set.greenGain, bg = g_set.blueGain;
+  if (rg == 100 && gg == 100 && bg == 100) return;  // unity: nothing to do
+
+  for (size_t i = 0; i + 1 < fb->len; i += 2) {
+    uint8_t hb = fb->buf[i], lb = fb->buf[i + 1];
+    uint16_t r5 = (hb >> 3) & 0x1F;
+    uint16_t g6 = ((hb & 0x07) << 3) | (lb >> 5);
+    uint16_t b5 = lb & 0x1F;
+
+    r5 = (uint16_t)((r5 * rg) / 100); if (r5 > 31) r5 = 31;
+    g6 = (uint16_t)((g6 * gg) / 100); if (g6 > 63) g6 = 63;
+    b5 = (uint16_t)((b5 * bg) / 100); if (b5 > 31) b5 = 31;
+
+    fb->buf[i]     = (uint8_t)((r5 << 3) | (g6 >> 3));
+    fb->buf[i + 1] = (uint8_t)(((g6 & 0x07) << 5) | b5);
+  }
+}
+
 static void publishJpeg(camera_fb_t *fb) {
+  applyColorGain(fb);
   uint8_t *out = nullptr;
   size_t outLen = 0;
   if (!frame2jpg(fb, 80, &out, &outLen)) return;
@@ -235,9 +269,11 @@ static esp_err_t settingsHandler(httpd_req_t *req) {
   char buf[256];
   int n = snprintf(buf, sizeof(buf),
     "{\"pixelThreshold\":%u,\"minChangedPermille\":%u,"
-    "\"hysteresisMs\":%lu,\"intervalMs\":%u}",
+    "\"hysteresisMs\":%lu,\"intervalMs\":%u,"
+    "\"redGain\":%u,\"greenGain\":%u,\"blueGain\":%u}",
     g_set.pixelThreshold, g_set.minChangedPermille,
-    (unsigned long)g_set.hysteresisMs, g_set.intervalMs);
+    (unsigned long)g_set.hysteresisMs, g_set.intervalMs,
+    g_set.redGain, g_set.greenGain, g_set.blueGain);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, n);
 }
@@ -273,6 +309,12 @@ static esp_err_t setHandler(httpd_req_t *req) {
     g_set.hysteresisMs = constrain(v, 0, 120000);
   if (getQueryLong(req, "intervalMs", &v))
     g_set.intervalMs = constrain(v, 10, 5000);
+  if (getQueryLong(req, "redGain", &v))
+    g_set.redGain = constrain(v, 0, 400);
+  if (getQueryLong(req, "greenGain", &v))
+    g_set.greenGain = constrain(v, 0, 400);
+  if (getQueryLong(req, "blueGain", &v))
+    g_set.blueGain = constrain(v, 0, 400);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }

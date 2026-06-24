@@ -92,12 +92,35 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
     <div class="hint" id="savemsg"></div>
   </section>
+
+  <section class="card">
+    <h2>Color levels (preview)</h2>
+    <div class="row">
+      <label>Red <b id="v_r">--%</b></label>
+      <input type="range" id="r" min="0" max="300" step="1">
+    </div>
+    <div class="row">
+      <label>Green <b id="v_g">--%</b></label>
+      <input type="range" id="g" min="0" max="300" step="1">
+    </div>
+    <div class="row">
+      <label>Blue <b id="v_b">--%</b></label>
+      <input type="range" id="b" min="0" max="300" step="1">
+    </div>
+    <div class="btns">
+      <button id="white">Neutral (100%)</button>
+    </div>
+    <div class="hint">Per-channel gain applied to the preview/snapshot (100% = unchanged).
+      Underwater, water absorbs red first, so raising Red often restores balance.
+      Use <b>Save to flash</b> above to persist. Motion detection is luminance-based and unaffected.</div>
+  </section>
 </main>
 
 <script>
 const $ = id => document.getElementById(id);
-const sliders = { pix:'pix', area:'area', hyst:'hyst', iv:'iv' };
-let busy = false;
+const sliders = { pix:'pix', area:'area', hyst:'hyst', iv:'iv', r:'r', g:'g', b:'b' };
+const keyMap = { pix:'pixelThreshold', area:'minChangedPermille', hyst:'hysteresisMs',
+                 iv:'intervalMs', r:'redGain', g:'greenGain', b:'blueGain' };
 
 function fmtMs(ms){ return ms >= 1000 ? (ms/1000).toFixed(1)+' s' : ms+' ms'; }
 
@@ -106,6 +129,9 @@ function paintSliderLabels(){
   $('v_area').textContent = ($('area').value/10).toFixed(1)+'%';
   $('v_hyst').textContent = fmtMs(+$('hyst').value);
   $('v_iv').textContent = $('iv').value+' ms';
+  $('v_r').textContent = $('r').value+'%';
+  $('v_g').textContent = $('g').value+'%';
+  $('v_b').textContent = $('b').value+'%';
 }
 
 async function loadSettings(){
@@ -114,6 +140,9 @@ async function loadSettings(){
   $('area').value = s.minChangedPermille;
   $('hyst').value = s.hysteresisMs;
   $('iv').value = s.intervalMs;
+  $('r').value = s.redGain;
+  $('g').value = s.greenGain;
+  $('b').value = s.blueGain;
   paintSliderLabels();
 }
 
@@ -125,10 +154,14 @@ Object.values(sliders).forEach(id => {
   const el = $(id);
   el.addEventListener('input', paintSliderLabels);
   el.addEventListener('change', async () => {
-    const map = { pix:'pixelThreshold', area:'minChangedPermille', hyst:'hysteresisMs', iv:'intervalMs' };
-    await pushSetting(map[id], el.value);
+    await pushSetting(keyMap[id], el.value);
   });
 });
+
+$('white').onclick = async () => {
+  for (const id of ['r','g','b']){ $(id).value = 100; await pushSetting(keyMap[id], 100); }
+  paintSliderLabels();
+};
 
 $('save').onclick = async () => {
   await fetch('/save'); $('savemsg').textContent = 'Saved to flash at '+new Date().toLocaleTimeString();
